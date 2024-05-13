@@ -1,102 +1,80 @@
+#define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <float.h>
 #include <time.h>
+#include <mpi.h>
 
-#define N 100000  // Number of points
-#define K 20      // Number of clusters
-#define NUM_THREADS 512  // Threads per block
+#define N 100000 // Number of points
+#define K 20     // Number of clusters
 
 typedef struct {
     double x;
     double y;
 } Point;
 
-// Device function to calculate distance between two points
-device double distance_gpu(Point a, Point b) {
-    return sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
-}
-// Host function to calculate distance for convergence checking
-double distance(Point a, Point b) {
-    return sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
-}
-// Custom atomicAdd function for double-precision floating points
-device double atomicAdd_custom(double* address, double val) {
-    unsigned long long int* address_as_ull = (unsigned long long int*)address;
-    unsigned long long int old = *address_as_ull, assumed;
-    do {
-        assumed = old;
-        old = atomicCAS(address_as_ull, assumed, __double_as_longlong(val + __longlong_as_double(assumed)));
-    } while (assumed != old);
-    return __longlong_as_double(old);
+int count[K] = { 0 }; // Global array to store the count of points in each cluster
+
+// Function to calculate Euclidean distance between two points
+double distance(Point point1, Point point2) {
+    return sqrt(pow(point1.x - point2.x, 2) + pow(point1.y - point2.y, 2));
 }
 
-global void assignPoints(Point* points, Point* centroids, int* labels, int numPoints, int numCentroids) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < numPoints) {
+// Function to assign points to the nearest cluster center
+void assignPoints(Point points[N], Point centroids[K], int labels[N], int start, int end) {
+    for (int i = start; i < end; i++) {
         double minDist = DBL_MAX;
-        int bestIndex = 0;
-        for (int i = 0; i < numCentroids; i++) {
-            double dist = distance_gpu(points[index], centroids[i]);
+        int newLabel = 0;
+        for (int j = 0; j < K; j++) {
+            double dist = distance(points[i], centroids[j]);
             if (dist < minDist) {
                 minDist = dist;
-                bestIndex = i;
+                newLabel = j;
             }
         }
-        labels[index] = bestIndex;
+        if (labels[i] != newLabel) {
+            labels[i] = newLabel;
+        }
     }
 }
 
-global void updateCentroids(Point* points, Point* centroids, int* labels, int* counts, int numPoints, int numCentroids) {
-    extern shared char shared_memory[];
-    Point* sharedCentroids = (Point*)shared_memory;
-    int* sharedCounts = (int*)(shared_memory + numCentroids * sizeof(Point));
-
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    int threadId = threadIdx.x;
-
-    // Initialize shared memory
-    if (threadId < numCentroids) {
-        sharedCentroids[threadId].x = 0;
-        sharedCentroids[threadId].y = 0;
-        sharedCounts[threadId] = 0;
+// Function to update the cluster centroids
+void updateCentroids(Point points[N], Point centroids[K], int labels[N], int start, int end) {
+    // Reset counts to 0 for all clusters
+    for (int i = 0; i < K; i++) {
+        count[i] = 0;
+        centroids[i].x = 0;
+        centroids[i].y = 0;
     }
-    __syncthreads();
 
-    // Update shared memory
-    if (index < numPoints) {
-        int label = labels[index];
-        atomicAdd_custom(&sharedCentroids[label].x, points[index].x);
-        atomicAdd_custom(&sharedCentroids[label].y, points[index].y);
-        atomicAdd(&sharedCounts[label], 1);
-    }
-    __syncthreads();
-
-    // Reduce shared memory to global memory
-    if (threadId < numCentroids) {
-        atomicAdd_custom(&centroids[threadId].x, sharedCentroids[threadId].x);
-        atomicAdd_custom(&centroids[threadId].y, sharedCentroids[threadId].y);
-        atomicAdd(&counts[threadId], sharedCounts[threadId]);
+    // Update centroids and count points in each cluster
+    for (int i = start; i < end; i++) {
+        int label = labels[i];
+        centroids[label].x += points[i].x;
+        centroids[label].y += points[i].y;
+        count[label]++;
     }
 }
 
-void readCSV(const char* filename, Point* array) {
+void readCSV(const char* filename, Point array[], int rows) {
     FILE* file = fopen(filename, "r");
     if (!file) {
         perror("Failed to open file");
         exit(EXIT_FAILURE);
     }
 
-    for (int i = 0; i < N; i++) {
-        if (fscanf(file, "%lf,%lf", &array[i].x, &array[i].y) != 2) {
-            fprintf(stderr, "Error reading file at row %d\n", i);
+    for (int i = 0; i < rows; i++) {
+        if (fscanf(file, "%lf,%lf,", &array[i].x, &array[i].y) != 2) {
+            fprintf(stderr, "Error reading file at row %d\n", i + 1);
             fclose(file);
             exit(EXIT_FAILURE);
         }
     }
+
     fclose(file);
 }
+
 // Comparison function for sorting points based on x-coordinate
 int comparePointsX(const void* a, const void* b) {
     Point* pointA = (Point*)a;
@@ -105,11 +83,10 @@ int comparePointsX(const void* a, const void* b) {
     if (pointA->x > pointB->x) return 1;
     return 0;
 }
-
 Point sortedPoints[N];
 
 // Function for choosing centroids using sorting
-void chooseCentroids(Point points[N], Point centroids[K]) {
+void chooseCentroids(Point points[N], Point centroids[K], int rank, int size) {
     // Create a temporary array to store points for sorting
     for (int i = 0; i < N; i++) {
         sortedPoints[i] = points[i];
@@ -120,13 +97,12 @@ void chooseCentroids(Point points[N], Point centroids[K]) {
 
     // Choose centroids from sorted points
     for (int i = 0; i < K; i++) {
-        centroids[i] = sortedPoints[i * (N / K)];
+        centroids[i] = sortedPoints[(i * N) / K];
     }
 }
 
-
-// function to check convergence
-int checkConvergence(Point* centroids, Point* old_centroids, double threshold) {
+// Function to check convergence based on centroid movement threshold
+int checkConvergence(Point centroids[K], Point old_centroids[K], double threshold) {
     double total_movement = 0.0;
     for (int i = 0; i < K; i++) {
         total_movement += distance(centroids[i], old_centroids[i]);
@@ -134,100 +110,93 @@ int checkConvergence(Point* centroids, Point* old_centroids, double threshold) {
     return (total_movement < threshold);
 }
 
-int main() {
-    Point* h_points = (Point*)malloc(N * sizeof(Point));
-    Point* h_centroids = (Point*)malloc(K * sizeof(Point));
-    int* h_labels = (int*)malloc(N * sizeof(int));
-    int* h_counts = (int*)calloc(K, sizeof(int));
-    Point* old_centroids = (Point*)malloc(K * sizeof(Point));
+Point points[N];          
+Point centroids[K];       // Centroids of the clusters
+Point old_centroids[K];   // Previous centroids
+int labels[N] = { 0 };    // Cluster labels for each point
 
-    readCSV("generated_points_large_2.csv", h_points);
-    chooseCentroids(h_points, h_centroids);
+int global_changed = 0;     
+
+
+int main() {
+    int rank, size;
+    MPI_Init(NULL, NULL);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // Read data from CSV file
+    readCSV("generated_points_large_2.csv", points, N);
+
+    // Initialize centroids using choose centroids function
+    chooseCentroids(points, centroids, rank, size);
 
     // Initialize old centroids for comparison
     for (int i = 0; i < K; i++) {
-        old_centroids[i] = h_centroids[i];
+        old_centroids[i] = centroids[i];
     }
 
-    Point* d_points, * d_centroids;
-    int* d_labels, * d_counts;
-    cudaMalloc(&d_points, N * sizeof(Point));
-    cudaMalloc(&d_centroids, K * sizeof(Point));
-    cudaMalloc(&d_labels, N * sizeof(int));
-    cudaMalloc(&d_counts, K * sizeof(int));
+    clock_t start, end;
+    double cpu_time_used;
 
-    cudaMemcpy(d_points, h_points, N * sizeof(Point), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_centroids, h_centroids, K * sizeof(Point), cudaMemcpyHostToDevice);
+    start = clock();
+    int i = 0;
+    int max_iterations = 105; // Maximum number of iterations
+    double centroid_movement_threshold = 0.01; // Centroid movement threshold
 
-    dim3 blocks((N + NUM_THREADS - 1) / NUM_THREADS);
-    dim3 threads(NUM_THREADS);
-
-    clock_t start = clock();
-
-    int iterations = 0;
-
-    int max_iterations = 105;
-    double centroid_movement_threshold = 0.01;
+    // Main K-means algorithm with convergence check
     do {
+        // Assign points to the nearest cluster center
+        assignPoints(points, centroids, labels, rank * (N / size), (rank + 1) * (N / size));
 
-        assignPoints << <blocks, threads >> > (d_points, d_centroids, d_labels, N, K);
-        cudaDeviceSynchronize();
-        //clear centroids and counts of device
-        cudaMemset(d_centroids, 0, K * sizeof(Point));
-        cudaMemset(d_counts, 0, K * sizeof(int));
-        cudaDeviceSynchronize();
+        // Update centroids based on local data
+        updateCentroids(points, centroids, labels, rank * (N / size), (rank + 1) * (N / size));
 
-        updateCentroids << <blocks, threads >> > (d_points, d_centroids, d_labels, d_counts, N, K);
-        cudaDeviceSynchronize();
+        // Synchronize centroids across processes
+        MPI_Allreduce(MPI_IN_PLACE, centroids, K * 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        // Synchronize counts across processes
+        MPI_Allreduce(MPI_IN_PLACE, count, K, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
 
-        cudaMemcpy(h_centroids, d_centroids, K * sizeof(Point), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_counts, d_counts, K * sizeof(int), cudaMemcpyDeviceToHost);
-
-        // finalize centroids positions
+        // Finalize centroid positions
         for (int j = 0; j < K; j++) {
-            if (h_counts[j] != 0) {
-                h_centroids[j].x /= h_counts[j];
-                h_centroids[j].y /= h_counts[j];
+            if (count[j] != 0) {
+                centroids[j].x /= count[j];
+                centroids[j].y /= count[j];
             }
-
         }
-        // Check for convergence
-        if (checkConvergence(h_centroids, old_centroids, centroid_movement_threshold)) {
-            printf("Converged. Centroid movement below threshold.\n");
+
+        i++;
+        if (rank == 0) {
+            printf("Rank %d, Iteration: %d\n", rank, i);
+        }
+
+        // Check for convergence on the root process
+        if (checkConvergence(centroids, old_centroids, centroid_movement_threshold)) {
+            if (rank == 0) {
+                printf("Converged. Centroid movement below threshold.\n");
+            }
             break;
         }
-        //recopy from host to device
-        cudaMemcpy(d_centroids, h_centroids, K * sizeof(Point), cudaMemcpyHostToDevice);
-        
-        // update old centroids array
+
+        // Save current centroids for next iteration
         for (int j = 0; j < K; j++) {
-            old_centroids[j] = h_centroids[j];
-
+            old_centroids[j] = centroids[j];
         }
-        iterations++;
-        printf("Iteration: %d\n", iterations);
 
-    } while (iterations < max_iterations);
+    } while (i < max_iterations); // Continue until max iterations reached
 
+    end = clock(); 
+    cpu_time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
 
-    clock_t end = clock();
-    double cpu_time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
-    cudaMemcpy(h_counts, d_counts, K * sizeof(int), cudaMemcpyDeviceToHost);
-
-    printf("K-means clustering completed in %f seconds\n", cpu_time_used);
-    printf("Cluster membership counts:\n");
-    for (int i = 0; i < K; i++) {
-        printf("Cluster %d has %d points.\n", i, h_counts[i]);
+   
+    if (rank == 0) {
+        printf("K-means clustering completed in %f seconds\n", cpu_time_used);
+        printf("Cluster membership counts:\n");
+        for (int i = 0; i < K; i++) {
+            printf("Cluster %d has %d points.\n", i, count[i]);
+        }
+        printf("Final iteration: %d\n", i);
     }
 
-    free(h_points);
-    free(h_centroids);
-    free(h_labels);
-    free(h_counts);
-    cudaFree(d_points);
-    cudaFree(d_centroids);
-    cudaFree(d_labels);
-    cudaFree(d_counts);
-
+    MPI_Finalize();
     return 0;
 }
